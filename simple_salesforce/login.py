@@ -116,6 +116,7 @@ def SalesforceLogin(**kwargs):
 
     session_id = getUniqueElementValueFromXmlString(response.content, 'sessionId')
     server_url = getUniqueElementValueFromXmlString(response.content, 'serverUrl')
+    organization_id = getUniqueElementValueFromXmlString(response.content, 'organizationId')
 
     sf_instance = (server_url
                    .replace('http://', '')
@@ -123,7 +124,7 @@ def SalesforceLogin(**kwargs):
                    .split('/')[0]
                    .replace('-api', ''))
 
-    return session_id, sf_instance
+    return session_id, sf_instance, organization_id
 
 
 class SalesforceAuthenticationFailed(Exception):
