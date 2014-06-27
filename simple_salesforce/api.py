@@ -65,7 +65,7 @@ class Salesforce(object):
             security_token = kwargs['security_token']
 
             # Pass along the username/password to our login helper
-            self.session_id, self.sf_instance = SalesforceLogin(
+            self.session_id, self.sf_instance, self.org_id = SalesforceLogin(
                 username=username,
                 password=password,
                 security_token=security_token,
