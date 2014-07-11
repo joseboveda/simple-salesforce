@@ -278,8 +278,8 @@ class Salesforce(object):
         # so check whether there are more results and retrieve them if so.
         return get_all_results(result, **kwargs)
 
-    def apexecute(self, action, method='GET', data=None):
-        result = self._call_salesforce(method, self.apex_url + action, data=json.dumps(data))
+    def apexecute(self, action, method='GET', data=None, params=None):
+        result = self._call_salesforce(method, self.apex_url + action, data=json.dumps(data), params=params)
 
         if result.status_code == 200:
             try:
