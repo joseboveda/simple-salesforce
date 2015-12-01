@@ -1,5 +1,10 @@
 """Core classes and exceptions for Simple-Salesforce"""
 
+
+# has to be defined prior to login import
+DEFAULT_API_VERSION = '29.0'
+
+
 import requests
 import json
 
@@ -9,7 +14,7 @@ except ImportError:
     # Python 3+
     from urllib.parse import urlparse
 from simple_salesforce.login import SalesforceLogin
-from simple_salesforce.util import date_to_iso8601
+from simple_salesforce.util import date_to_iso8601, SalesforceError
 
 try:
     from collections import OrderedDict
@@ -24,7 +29,11 @@ class Salesforce(object):
     An instance of Salesforce is a handy way to wrap a Salesforce session
     for easy use of the Salesforce REST API.
     """
-    def __init__(self, **kwargs):
+    def __init__(
+            self, username=None, password=None, security_token=None,
+            session_id=None, instance=None, instance_url=None,
+            organizationId=None, sandbox=False, version=DEFAULT_API_VERSION,
+            proxies=None, session=None):
         """Initialize the instance with the given parameters.
 
         Available kwargs
@@ -46,23 +55,23 @@ class Salesforce(object):
         OR
         * instance_url -- Full URL of your instance i.e. `https://na1.salesforce.com
 
-
         Universal Kwargs:
         * version -- the version of the Salesforce API to use, for example `29.0`
         * proxies -- the optional map of scheme to proxy server
+        * session -- Custom requests session, created in calling code. This
+                     enables the use of requets Session features not otherwise
+                     exposed by simple_salesforce.
+
         """
 
         # Determine if the user passed in the optional version and/or sandbox kwargs
-        self.sf_version = kwargs.get('version', '29.0')
-        self.sandbox = kwargs.get('sandbox', False)
-        self.proxies = kwargs.get('proxies')
+        self.sf_version = version
+        self.sandbox = sandbox
+        self.proxies = proxies
 
         # Determine if the user wants to use our username/password auth or pass in their own information
-        if 'username' in kwargs and 'password' in kwargs and 'security_token' in kwargs:
+        if all(arg is not None for arg in (username, password, security_token)):
             self.auth_type = "password"
-            username = kwargs['username']
-            password = kwargs['password']
-            security_token = kwargs['security_token']
 
             # Pass along the username/password to our login helper
             self.session_id, self.sf_instance, self.org_id = SalesforceLogin(
@@ -73,22 +82,19 @@ class Salesforce(object):
                 sf_version=self.sf_version,
                 proxies=self.proxies)
 
-        elif 'session_id' in kwargs and ('instance' in kwargs or 'instance_url' in kwargs):
+        elif all(arg is not None for arg in (session_id, instance or instance_url)):
             self.auth_type = "direct"
-            self.session_id = kwargs['session_id']
+            self.session_id = session_id
 
             # If the user provides the full url (as returned by the OAuth interface for
             # example) extract the hostname (which we rely on)
-            if 'instance_url' in kwargs:
-                self.sf_instance = urlparse(kwargs['instance_url']).hostname
+            if instance_url is not None:
+                self.sf_instance = urlparse(instance_url).hostname
             else:
-                self.sf_instance = kwargs['instance']
+                self.sf_instance = instance
 
-        elif 'username' in kwargs and 'password' in kwargs and 'organizationId' in kwargs:
+        elif all(arg is not None for arg in (username, password, organizationId)):
             self.auth_type = 'ipfilter'
-            username = kwargs['username']
-            password = kwargs['password']
-            organizationId = kwargs['organizationId']
 
             # Pass along the username/password to our login helper
             self.session_id, self.sf_instance, self.org_id = SalesforceLogin(
@@ -100,15 +106,16 @@ class Salesforce(object):
                 proxies=self.proxies)
 
         else:
-            raise SalesforceGeneralError(
-                'You must provide login information or an instance and token')
+            raise TypeError(
+                'You must provide login information or an instance and token'
+            )
 
         if self.sandbox:
             self.auth_site = 'https://test.salesforce.com'
         else:
             self.auth_site = 'https://login.salesforce.com'
 
-        self.request = requests.Session()
+        self.request = session or requests.Session()
         self.request.proxies = self.proxies
         self.headers = {
             'Content-Type': 'application/json',
@@ -126,7 +133,10 @@ class Salesforce(object):
         url = self.base_url + "sobjects"
         result = self.request.get(url, headers=self.headers)
         if result.status_code != 200:
-            raise SalesforceGeneralError(result.content)
+            raise SalesforceGeneralError(url,
+                                         'describe',
+                                         result.status_code,
+                                         result.content)
         json_result = result.json(object_pairs_hook=OrderedDict)
         if len(json_result) == 0:
             return None
@@ -147,7 +157,72 @@ class Salesforce(object):
 
         * name -- the name of a Salesforce object type, e.g. Lead or Contact
         """
+        
+        # fix to enable serialization (https://github.com/heroku/simple-salesforce/issues/60)
+        if name.startswith('__'):
+            return super(Salesforce, self).__getattr__(name)
+
         return SFType(name, self.session_id, self.sf_instance, self.sf_version, self.proxies)
+
+    # User utlity methods
+    def set_password(self, user, password):
+        """Sets the password of a user
+
+        salesforce dev documentation link:
+        https://www.salesforce.com/us/developer/docs/api_rest/Content/dome_sobject_user_password.htm
+
+        Arguments:
+
+        * user: the userID of the user to set
+        * password: the new password
+        """
+
+        url = self.base_url + 'sobjects/User/%s/password' % user
+        params = { 'NewPassword' : password, }
+
+        result = self.request.post(url, headers=self.headers, data=json.dumps(params))
+
+        # salesforce return 204 No Content when the request is successful
+        if result.status_code != 200 and result.status_code != 204:
+            raise SalesforceGeneralError(url,
+                                         'User',
+                                         result.status_code,
+                                         result.content)
+        json_result = result.json(object_pairs_hook=OrderedDict)
+        if len(json_result) == 0:
+            return None
+        else:
+            return json_result
+
+    def setPassword(self, user, password):
+        import warnings
+        warnings.warn(
+            "This method has been deprecated. Please use set_password instread.", DeprecationWarning)
+        return self.set_password(user, password)
+
+    # Generic Rest Function
+    def restful(self, path, params):
+        """Allows you to make a direct REST call if you know the path
+
+        Arguments:
+
+        * path: The path of the request
+            Example: sobjects/User/ABC123/password'
+        * params: dict of parameters to pass to the path
+        """
+
+        url = self.base_url + path
+        result = self.request.get(url, headers=self.headers, params=params)
+        if result.status_code != 200:
+            raise SalesforceGeneralError(url,
+                                         path,
+                                         result.status_code,
+                                         result.content)
+        json_result = result.json(object_pairs_hook=OrderedDict)
+        if len(json_result) == 0:
+            return None
+        else:
+            return json_result
 
     # Search Functions
     def search(self, search):
@@ -165,7 +240,10 @@ class Salesforce(object):
         params = {'q': search}
         result = self.request.get(url, headers=self.headers, params=params)
         if result.status_code != 200:
-            raise SalesforceGeneralError(result.content)
+            raise SalesforceGeneralError(url,
+                                         'search',
+                                         result.status_code,
+                                         result.content)
         json_result = result.json(object_pairs_hook=OrderedDict)
         if len(json_result) == 0:
             return None
@@ -278,8 +356,18 @@ class Salesforce(object):
         # so check whether there are more results and retrieve them if so.
         return get_all_results(result, **kwargs)
 
-    def apexecute(self, action, method='GET', data=None, params=None):
-        result = self._call_salesforce(method, self.apex_url + action, data=json.dumps(data), params=params)
+    def apexecute(self, action, method='GET', data=None, **kwargs):
+        """Makes an HTTP request to an APEX REST endpoint
+
+        Arguments:
+
+        * action -- The REST endpoint for the request.
+        * method -- HTTP method for the request (default GET)
+        * data -- A dict of parameters to send in a POST / PUT request
+        * kwargs -- Additional kwargs to pass to `requests.request`
+        """
+        result = self._call_salesforce(method, self.apex_url + action,
+                                       data=json.dumps(data), **kwargs)
 
         if result.status_code == 200:
             try:
@@ -293,12 +381,7 @@ class Salesforce(object):
 
         Returns a `requests.result` object.
         """
-        headers = {
-            'Content-Type': 'application/json',
-            'Authorization': 'Bearer ' + self.session_id,
-            'X-PrettyPrint': '1'
-        }
-        result = self.request.request(method, url, headers=headers, **kwargs)
+        result = self.request.request(method, url, headers=self.headers, **kwargs)
 
         if result.status_code >= 300:
             _exception_handler(result)
@@ -363,6 +446,20 @@ class SFType(object):
         result = self._call_salesforce('GET', self.base_url + record_id)
         return result.json(object_pairs_hook=OrderedDict)
 
+    def get_by_custom_id(self, custom_id_field, custom_id):
+        """Returns the result of a GET to `.../{object_name}/{custom_id_field}/{custom_id}` as a
+        dict decoded from the JSON payload returned by Salesforce.
+
+        Arguments:
+
+        * custom_id_field -- the API name of a custom field that was defined as an External ID
+        * custom_id - the External ID value of the SObject to get
+        """
+        custom_url = self.base_url + '{custom_id_field}/{custom_id}'.format(
+            custom_id_field=custom_id_field, custom_id=custom_id)
+        result = self._call_salesforce('GET', custom_url)
+        return result.json(object_pairs_hook=OrderedDict)
+
     def create(self, data):
         """Creates a new SObject using a POST to `.../{object_name}/`.
 
@@ -377,11 +474,13 @@ class SFType(object):
                                        data=json.dumps(data))
         return result.json(object_pairs_hook=OrderedDict)
 
-    def upsert(self, record_id, data):
+    def upsert(self, record_id, data, raw_response=False):
         """Creates or updates an SObject using a PATCH to
         `.../{object_name}/{record_id}`.
 
-        Returns a dict decoded from the JSON payload returned by Salesforce.
+        If `raw_response` is false (the default), returns the status code
+        returned by Salesforce. Otherwise, return the `requests.Response`
+        object.
 
         Arguments:
 
@@ -389,39 +488,49 @@ class SFType(object):
                        Salesforce documentation
         * data -- a dict of the data to create or update the SObject from. It
                   will be JSON-encoded before being transmitted.
+        * raw_response -- a boolean indicating whether to return the response
+                          directly, instead of the status code.
         """
         result = self._call_salesforce('PATCH', self.base_url + record_id,
                                        data=json.dumps(data))
-        return result.status_code
+        return self._raw_response(result, raw_response)
 
-    def update(self, record_id, data):
+    def update(self, record_id, data, raw_response=False):
         """Updates an SObject using a PATCH to
         `.../{object_name}/{record_id}`.
 
-        Returns a dict decoded from the JSON payload returned by Salesforce.
+        If `raw_response` is false (the default), returns the status code
+        returned by Salesforce. Otherwise, return the `requests.Response`
+        object.
 
         Arguments:
 
         * record_id -- the Id of the SObject to update
         * data -- a dict of the data to update the SObject from. It will be
                   JSON-encoded before being transmitted.
+        * raw_response -- a boolean indicating whether to return the response
+                          directly, instead of the status code.
         """
         result = self._call_salesforce('PATCH', self.base_url + record_id,
                                        data=json.dumps(data))
-        return result.status_code
+        return self._raw_response(result, raw_response)
 
-    def delete(self, record_id):
+    def delete(self, record_id, raw_response=False):
         """Deletes an SObject using a DELETE to
         `.../{object_name}/{record_id}`.
 
-        Returns a dict decoded from the JSON payload returned by Salesforce.
+        If `raw_response` is false (the default), returns the status code
+        returned by Salesforce. Otherwise, return the `requests.Response`
+        object.
 
         Arguments:
 
         * record_id -- the Id of the SObject to delete
+        * raw_response -- a boolean indicating whether to return the response
+                          directly, instead of the status code.
         """
         result = self._call_salesforce('DELETE', self.base_url + record_id)
-        return result.status_code
+        return self._raw_response(result, raw_response)
 
     def deleted(self, start, end):
         """Use the SObject Get Deleted resource to get a list of deleted records for the specified object.
@@ -466,6 +575,17 @@ class SFType(object):
 
         return result
 
+    def _raw_response(self, response, body_flag):
+        """Utility method for processing the response and returning either the
+        status code or the response object.
+
+        Returns either an `int` or a `requests.Response` object.
+        """
+        if not body_flag:
+            return response.status_code
+        else:
+            return response
+
 
 class SalesforceAPI(Salesforce):
     """Depreciated SalesforceAPI Instance
@@ -490,93 +610,89 @@ class SalesforceAPI(Salesforce):
         """
         import warnings
         warnings.warn(
-            "Use of login arguments has been depreciated. Please use kwargs", DeprecationWarning)
+            "Use of login arguments has been depreciated. Please use kwargs",
+            DeprecationWarning
+        )
 
-        super(
-            SalesforceAPI, self).__init__(username=username, password=password,
-                                          security_token=security_token, sandbox=sandbox, version=sf_version)
+        super(SalesforceAPI, self).__init__(username=username,
+                                            password=password,
+                                            security_token=security_token,
+                                            sandbox=sandbox,
+                                            version=sf_version)
 
 
 def _exception_handler(result, name=""):
     """Exception router. Determines which error to raise for bad results"""
-    url = result.url
     try:
         response_content = result.json()
     except Exception:
         response_content = result.text
 
-    if result.status_code == 300:
-        message = u"More than one record for {url}. Response content: {content}"
-        message = message.format(url=url, content=response_content)
-        raise SalesforceMoreThanOneRecord(message)
-    elif result.status_code == 400:
-        message = u"Malformed request {url}. Response content: {content}"
-        message = message.format(url=url, content=response_content)
-        raise SalesforceMalformedRequest(message)
-    elif result.status_code == 401:
-        message = u"Expired session for {url}. Response content: {content}"
-        message = message.format(url=url, content=response_content)
-        raise SalesforceExpiredSession(message)
-    elif result.status_code == 403:
-        message = u"Request refused for {url}. Response content: {content}"
-        message = message.format(url=url, content=response_content)
-        raise SalesforceRefusedRequest(message)
-    elif result.status_code == 404:
-        message = u'Resource {name} Not Found. Response content: {content}'
-        message = message.format(name=name, content=response_content)
-        raise SalesforceResourceNotFound(message)
-    else:
-        message = u'Error Code {status}. Response content: {content}'
-        message = message.format(status=result.status_code, content=response_content)
-        raise SalesforceGeneralError(message)
+    exc_map = {
+        300: SalesforceMoreThanOneRecord,
+        400: SalesforceMalformedRequest,
+        401: SalesforceExpiredSession,
+        403: SalesforceRefusedRequest,
+        404: SalesforceResourceNotFound,
+    }
+    exc_cls = exc_map.get(result.status_code, SalesforceGeneralError)
+
+    raise exc_cls(result.url, result.status_code, name, response_content)
 
 
-class SalesforceMoreThanOneRecord(Exception):
+class SalesforceMoreThanOneRecord(SalesforceError):
     """
     Error Code: 300
     The value returned when an external ID exists in more than one record. The
     response body contains the list of matching records.
     """
-    pass
+    message = u"More than one record for {url}. Response content: {content}"
 
 
-class SalesforceMalformedRequest(Exception):
+class SalesforceMalformedRequest(SalesforceError):
     """
     Error Code: 400
     The request couldn't be understood, usually becaue the JSON or XML body contains an error.
     """
-    pass
+    message = u"Malformed request {url}. Response content: {content}"
 
 
-class SalesforceExpiredSession(Exception):
+class SalesforceExpiredSession(SalesforceError):
     """
     Error Code: 401
     The session ID or OAuth token used has expired or is invalid. The response
     body contains the message and errorCode.
     """
-    pass
+    message = u"Expired session for {url}. Response content: {content}"
 
 
-class SalesforceRefusedRequest(Exception):
+class SalesforceRefusedRequest(SalesforceError):
     """
     Error Code: 403
     The request has been refused. Verify that the logged-in user has
     appropriate permissions.
     """
-    pass
+    message = u"Request refused for {url}. Response content: {content}"
 
 
-class SalesforceResourceNotFound(Exception):
+class SalesforceResourceNotFound(SalesforceError):
     """
     Error Code: 404
     The requested resource couldn't be found. Check the URI for errors, and
     verify that there are no sharing issues.
     """
-    pass
+    message = u'Resource {name} Not Found. Response content: {content}'
+
+    def __str__(self):
+        return self.message.format(name=self.resource_name,
+                                   content=self.content)
 
 
-class SalesforceGeneralError(Exception):
+class SalesforceGeneralError(SalesforceError):
     """
     A non-specific Salesforce error.
     """
-    pass
+    message = u'Error Code {status}. Response content: {content}'
+
+    def __str__(self):
+        return self.message.format(status=self.status, content=self.content)

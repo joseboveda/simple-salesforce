@@ -4,11 +4,13 @@ from simple_salesforce.api import (
     Salesforce,
     SalesforceAPI,
     SFType,
+    SalesforceError,
     SalesforceMoreThanOneRecord,
     SalesforceExpiredSession,
     SalesforceRefusedRequest,
     SalesforceResourceNotFound,
-    SalesforceGeneralError
+    SalesforceGeneralError,
+    SalesforceMalformedRequest
 )
 
 from simple_salesforce.login import (
